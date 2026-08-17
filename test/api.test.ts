@@ -3,7 +3,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { PiDshRuntime, type PiDshRuntimeOptions } from "../src/api.ts";
+import { PiDshRuntime, PiDshSessionError, type PiDshRuntimeOptions } from "../src/api.ts";
 import { NodeDurableExecutionEnv } from "../src/env.ts";
 import { DurableSessionRepository } from "../src/repo.ts";
 import type { AgentTool, StreamFn } from "../vendor/pi/types.ts";
@@ -162,6 +162,20 @@ describe("PiDshRuntime", () => {
 		await reopened.close();
 	});
 
+	it("releases the writer lock even when runtime disposal reports an error", async () => {
+		const { runtime, repository } = await fixture(immediateStream(), {
+			disposeRuntimeContributions: () => {
+				throw new Error("runtime dispose failed");
+			},
+		});
+		const session = await runtime.createSession({ id: "dispose-error", cwd: "/workspace" });
+		await session.prompt("hello");
+
+		await expect(session.close()).rejects.toThrow("Session shutdown completed with errors");
+		const reopened = await repository.open("dispose-error");
+		await reopened.close();
+	});
+
 	it("rejects concurrent runs and work after close", async () => {
 		const started = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -183,6 +197,139 @@ describe("PiDshRuntime", () => {
 		await first;
 		await session.close();
 		await expect(session.followUp("later")).rejects.toThrow("closed");
+	});
+
+	it("keeps admission closed while post-run drain settles", async () => {
+		const drainStarted = Promise.withResolvers<void>();
+		const releaseDrain = Promise.withResolvers<void>();
+		const { runtime } = await fixture(immediateStream(), {
+			postRunDrain: async ({ lastOperation }) => {
+				expect(lastOperation).toMatchObject({ outcome: "completed" });
+				drainStarted.resolve();
+				await releaseDrain.promise;
+			},
+		});
+		const session = await runtime.createSession({ id: "post-run-drain", cwd: "/workspace" });
+
+		const prompt = session.prompt("first");
+		await drainStarted.promise;
+		expect(() => session.prompt("second")).toThrow(PiDshSessionError);
+		try {
+			session.resume();
+			throw new Error("resume should have failed");
+		} catch (error) {
+			expect(error).toBeInstanceOf(PiDshSessionError);
+			expect((error as PiDshSessionError).code).toBe("SESSION_POST_RUN_DRAIN");
+		}
+		releaseDrain.resolve();
+		await prompt;
+		await session.close();
+	});
+
+	it("inspects the base component graph with provider marked non-replaceable", async () => {
+		const tool: AgentTool = {
+			name: "checkpoint",
+			label: "Checkpoint",
+			description: "Return a checkpoint",
+			parameters: Type.Object({}),
+			async execute() {
+				return { content: [{ type: "text", text: "checkpoint complete" }], details: {} };
+			},
+		};
+		const { runtime } = await fixture(immediateStream(), {
+			tools: [tool],
+			getRuntimeContributions: () => ({
+				promptContributors: [{ id: "extension:hint", text: "Prefer the contributed workflow" }],
+			}),
+		});
+		const session = await runtime.createSession({ id: "components", cwd: "/workspace" });
+
+		await expect(session.inspectComponents()).resolves.toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "provider:default",
+					kind: "provider",
+					replaceable: false,
+					status: "active",
+				}),
+				expect.objectContaining({
+					id: "tools:base",
+					replaceable: true,
+					details: { toolNames: ["checkpoint"] },
+				}),
+				expect.objectContaining({
+					id: "prompt:base",
+					replaceable: true,
+					details: { contributorIds: ["extension:hint"] },
+				}),
+			]),
+		);
+		await session.close();
+	});
+
+	it("uses a replaced tools component on the next admitted request", async () => {
+		const seenToolNames: string[][] = [];
+		const streamFn: StreamFn = (_model, context) => {
+			seenToolNames.push(context.tools?.map((tool) => tool.name) ?? []);
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: assistant() }));
+			return stream;
+		};
+		const oldTool: AgentTool = {
+			name: "old-tool",
+			label: "Old",
+			description: "old",
+			parameters: Type.Object({}),
+			async execute() { return { content: [{ type: "text", text: "old" }], details: {} }; },
+		};
+		const newTool: AgentTool = {
+			name: "new-tool",
+			label: "New",
+			description: "new",
+			parameters: Type.Object({}),
+			async execute() { return { content: [{ type: "text", text: "new" }], details: {} }; },
+		};
+		const { runtime } = await fixture(streamFn, { tools: [oldTool] });
+		const session = await runtime.createSession({ id: "replace-tools", cwd: "/workspace" });
+
+		await session.replaceComponent("tools:base", {
+			id: "tools:base",
+			kind: "tools",
+			replaceable: true,
+			activate: () => [newTool],
+		});
+		await session.prompt("hello");
+
+		expect(seenToolNames[0]).toContain("new-tool");
+		expect(seenToolNames[0]).not.toContain("old-tool");
+		await session.close();
+	});
+
+	it("supports the complete human/API extension lifecycle while idle", async () => {
+		const { runtime } = await fixture();
+		const session = await runtime.createSession({ id: "human-extension", cwd: "/workspace" });
+		const first = await session.defineExtension({
+			extensionId: "human",
+			purpose: "human lifecycle",
+			source: "async (ctx) => {}",
+			manifest: {},
+		});
+		await session.approveExtension("human", first.revisionId, first.sourceHash);
+		await session.runExtension("human", first.revisionId);
+
+		const second = await session.updateExtension({
+			extensionId: "human",
+			purpose: "human lifecycle revision two",
+			source: "async (ctx) => { await ctx.now(); }",
+			manifest: {},
+		});
+		await session.approveExtension("human", second.revisionId, second.sourceHash);
+		await session.rollbackExtension("human", first.revisionId);
+		expect((await session.inspectExtensions()).definitions[0]?.activeRevisionId).toBe(first.revisionId);
+		await session.stopExtension("human");
+		await session.removeExtension("human");
+		expect((await session.inspectExtensions()).definitions).toEqual([]);
+		await session.close();
 	});
 
 	it("compacts at a step boundary inside the active run", async () => {

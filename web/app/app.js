@@ -5,11 +5,16 @@ const state = {
 	session: null,
 	view: "trajectory",
 	category: "all",
+	surface: "all",
 	search: "",
+	query: "",
+	queryResults: [],
+	queryTimer: null,
 	selectedSeq: null,
 	detailTab: "summary",
 	eventSource: null,
 	refreshTimer: null,
+	lineage: null,
 };
 
 const ui = Object.fromEntries(
@@ -17,10 +22,11 @@ const ui = Object.fromEntries(
 		"session-list", "session-count", "session-search", "session-kicker", "session-title", "session-path",
 		"session-metrics", "issues-banner", "event-search", "event-filters", "event-list", "event-detail",
 		"view-chat", "view-trajectory", "live-dot", "live-label", "reload-button", "toast",
+		"query-search", "surface-filter", "query-results",
 	].map((id) => [id.replaceAll("-", "_"), document.getElementById(id)]),
 );
 
-const CATEGORY_ORDER = ["all", "operation", "request", "user", "assistant", "tool", "constraint", "compaction", "repair", "queue", "usage", "storage", "record"];
+const CATEGORY_ORDER = ["all", "operation", "request", "user", "assistant", "tool", "constraint", "extension", "compaction", "repair", "queue", "usage", "storage", "record"];
 
 function node(tag, attributes = {}, children = []) {
 	const element = document.createElement(tag);
@@ -109,6 +115,7 @@ async function selectSession(id) {
 	setLive("loading", "reading durable log");
 	try {
 		await loadSelectedSession();
+		await loadLineage();
 		followSelectedSession();
 	} catch (error) {
 		setLive("error", "read failed");
@@ -125,7 +132,19 @@ async function loadSelectedSession({ preserveSelection = false } = {}) {
 		state.selectedSeq = session.events.at(-1)?.seq ?? null;
 	}
 	renderSession();
+	renderQueryResults();
 	setLive("live", "following durable writes");
+}
+
+async function loadLineage() {
+	const id = state.selectedSessionId;
+	if (!id) return;
+	try {
+		state.lineage = await fetchJson(`/api/sessions/${encodeURIComponent(id)}/lineage`);
+	} catch {
+		state.lineage = null;
+	}
+	renderSession();
 }
 
 function followSelectedSession() {
@@ -193,11 +212,13 @@ function renderSession() {
 		metric("messages", session.chat.length),
 		metric("bytes", formatBytes(session.summary.sizeBytes)),
 		metric("state", session.summary.corruptionState),
+		metric("lineage", state.lineage?.lineage?.length ?? 1),
 	);
 	renderIssues();
 	renderFilters();
 	renderLedger();
 	renderDetail();
+	renderQueryResults();
 }
 
 function metric(label, value) {
@@ -238,8 +259,39 @@ function filteredEvents() {
 	const query = state.search.toLowerCase().trim();
 	return state.session.events.filter((event) => {
 		if (state.category !== "all" && event.category !== state.category) return false;
+		if (state.surface !== "all" && event.surface !== state.surface) return false;
 		return !query || event.searchText.includes(query) || JSON.stringify(event.payload).toLowerCase().includes(query);
 	});
+}
+
+function renderQueryResults() {
+	if (!ui.query_results) return;
+	ui.query_results.replaceChildren();
+	if (!state.query.trim()) {
+		ui.query_results.hidden = true;
+		return;
+	}
+	ui.query_results.hidden = false;
+	if (state.queryResults.length === 0) {
+		ui.query_results.append(node("span", { className: "query-empty", text: "No query citations" }));
+		return;
+	}
+	ui.query_results.append(...state.queryResults.slice(0, 8).map((result) => node("button", {
+		type: "button",
+		className: `query-result is-${result.event.surface ?? "log-only"}`,
+		title: `${result.sessionId} seq ${result.event.seq} line ${result.event.line}`,
+		onClick: async () => {
+			if (result.sessionId === state.selectedSessionId) selectEvent(result.event.seq);
+			else {
+				await selectSession(result.sessionId);
+				selectEvent(result.event.seq);
+			}
+		},
+	}, [
+		node("span", { text: result.event.surface ?? "log-only" }),
+		node("strong", { text: result.event.label }),
+		node("small", { text: `${shortId(result.sessionId)}:${result.event.seq}` }),
+	])));
 }
 
 function renderLedger() {
@@ -276,6 +328,7 @@ function eventRow(event) {
 		node("span", { className: "event-body" }, [
 			node("span", { className: "event-labels" }, [
 				node("span", { className: `source-badge is-${event.category}`, text: event.category }),
+				node("span", { className: `surface-badge is-${event.surface ?? "log-only"}`, text: event.surface ?? "log-only" }),
 				node("strong", { text: event.label }),
 				event.lane ? node("small", { text: event.lane }) : node("span"),
 			]),
@@ -344,7 +397,21 @@ function detailContent(event) {
 	]);
 	return node("div", { className: "summary-view" }, [
 		node("p", { className: "detail-summary", text: event.summary }),
-		definitionList([["kind", event.kind], ["category", event.category], ["id", event.id ?? "—"], ["parent", event.parentId ?? "—"], ["tool call", event.toolCallId ?? "—"]]),
+		definitionList([
+			["kind", event.kind],
+			["category", event.category],
+			["surface", event.surface ?? "log-only"],
+			["id", event.id ?? "—"],
+			["parent", event.parentId ?? "—"],
+			["tool call", event.toolCallId ?? "—"],
+			["replaces", event.replacesSeqs?.join(", ") || "—"],
+			["sources", event.sourceSeqs?.join(", ") || "—"],
+			["derived", event.derivedSeqs?.join(", ") || "—"],
+		]),
+		node("div", { className: "detail-actions" }, [
+			node("button", { className: "correlation", type: "button", text: "read event window", onClick: () => void inspectWindow(event.seq) }),
+			node("button", { className: "correlation", type: "button", text: "trace event", onClick: () => void inspectTrace(event.seq) }),
+		]),
 		event.correlationId ? node("button", { className: "correlation", type: "button", text: `trace correlation · ${shortId(event.correlationId)}`, onClick: () => traceCorrelation(event.correlationId) }) : node("span"),
 	]);
 }
@@ -368,6 +435,68 @@ function traceCorrelation(id) {
 	setView("trajectory");
 }
 
+async function inspectWindow(seq) {
+	if (!state.selectedSessionId) return;
+	try {
+		const windowResult = await fetchJson(`/api/sessions/${encodeURIComponent(state.selectedSessionId)}/events/${seq}/window?before=3&after=3`);
+		state.query = `window:${seq}`;
+		ui.query_search.value = state.query;
+		state.queryResults = windowResult.events.map((event) => ({
+			sessionId: windowResult.sessionId,
+			event,
+			citation: { sessionId: windowResult.sessionId, seq: event.seq, line: event.line },
+		}));
+		renderQueryResults();
+	} catch (error) {
+		toast(`Could not read event window: ${error.message}`);
+	}
+}
+
+async function inspectTrace(seq) {
+	if (!state.selectedSessionId) return;
+	try {
+		const trace = await fetchJson(`/api/sessions/${encodeURIComponent(state.selectedSessionId)}/events/${seq}/trace`);
+		state.query = `trace:${seq}`;
+		ui.query_search.value = state.query;
+		state.queryResults = trace.events.map((event) => ({
+			sessionId: trace.sessionId,
+			event,
+			citation: { sessionId: trace.sessionId, seq: event.seq, line: event.line },
+		}));
+		renderQueryResults();
+	} catch (error) {
+		toast(`Could not trace event: ${error.message}`);
+	}
+}
+
+function scheduleQuerySearch() {
+	clearTimeout(state.queryTimer);
+	state.queryTimer = setTimeout(() => {
+		void runQuerySearch();
+	}, 150);
+}
+
+async function runQuerySearch() {
+	const query = state.query.trim();
+	if (!query || query.startsWith("window:") || query.startsWith("trace:")) {
+		state.queryResults = [];
+		renderQueryResults();
+		return;
+	}
+	const params = new URLSearchParams({ q: query, limit: "40" });
+	if (state.selectedSessionId) params.set("session", state.selectedSessionId);
+	if (state.surface !== "all") params.set("surface", state.surface);
+	try {
+		const response = await fetchJson(`/api/query/search?${params.toString()}`);
+		state.queryResults = response.results;
+		renderQueryResults();
+	} catch (error) {
+		state.queryResults = [];
+		renderQueryResults();
+		toast(`Query failed: ${error.message}`);
+	}
+}
+
 function setView(view) {
 	state.view = view;
 	ui.view_chat.classList.toggle("is-active", view === "chat");
@@ -381,7 +510,18 @@ ui.view_chat.addEventListener("click", () => setView("chat"));
 ui.view_trajectory.addEventListener("click", () => setView("trajectory"));
 ui.session_search.addEventListener("input", (event) => { state.sessionFilter = event.target.value; renderSessions(); });
 ui.event_search.addEventListener("input", (event) => { state.search = event.target.value; renderLedger(); });
-ui.reload_button.addEventListener("click", () => void loadSessions({ select: false }).then(() => state.selectedSessionId && loadSelectedSession({ preserveSelection: true })));
+ui.query_search.addEventListener("input", (event) => { state.query = event.target.value; scheduleQuerySearch(); });
+ui.surface_filter.addEventListener("change", (event) => {
+	state.surface = event.target.value;
+	renderLedger();
+	scheduleQuerySearch();
+});
+ui.reload_button.addEventListener("click", () => {
+	void (async () => {
+		await loadSessions({ select: false });
+		if (state.selectedSessionId) await loadSelectedSession({ preserveSelection: true });
+	})();
+});
 ui.event_list.addEventListener("keydown", (event) => {
 	if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
 	const rows = state.view === "trajectory" ? filteredEvents() : filteredChat();
@@ -395,6 +535,7 @@ document.addEventListener("keydown", (event) => {
 });
 window.addEventListener("beforeunload", () => {
 	clearTimeout(state.refreshTimer);
+	clearTimeout(state.queryTimer);
 	state.eventSource?.close();
 });
 

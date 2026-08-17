@@ -243,6 +243,96 @@ describe("PiDshLoopAdapter", () => {
 		const messages = await session.findEntries({ type: "message", order: "oldestFirst" });
 		expect(JSON.stringify(messages)).not.toContain("session-constraints");
 	});
+
+	it("injects runtime prompt contributors into request snapshots", async () => {
+		const repo = new InMemorySessionRepo();
+		const session = await repo.create({ id: "prompt-contributors" });
+		let requestMessages: Message[] = [];
+		const streamFn: StreamFn = (requestModel, context) => {
+			requestMessages = [...context.messages];
+			return streamOne(assistantDone())(requestModel, context);
+		};
+		const adapter = new PiDshLoopAdapter({
+			store: session,
+			context: { systemPrompt: "system", messages: [] },
+			config: { model, convertToLlm: asMessages },
+			streamFn,
+			idGenerator: idSequence(),
+			getRuntimeContributions: () => ({
+				promptContributors: [{ id: "extension:hint", text: "Prefer the contributed workflow" }],
+			}),
+		});
+
+		await adapter.runPrompt({ prompts: [{ role: "user", content: "start", timestamp: 1 }] });
+
+		expect(JSON.stringify(requestMessages)).toContain("Prefer the contributed workflow");
+		const [snapshot] = await session.findEntries({ type: "custom", customType: "request-header" });
+		expect(snapshot).toMatchObject({
+			type: "custom",
+			data: {
+				promptContributors: [{ id: "extension:hint", text: "Prefer the contributed workflow" }],
+			},
+		});
+	});
+
+	it("keeps runtime tool contributions stable for the whole operation", async () => {
+		const repo = new InMemorySessionRepo();
+		const session = await repo.create({ id: "runtime-tools" });
+		let contributionSnapshots = 0;
+		const runtimeTool: AgentTool = {
+			name: "checkpoint",
+			description: "checkpoint",
+			label: "Checkpoint",
+			parameters: Type.Object({ input: Type.String() }),
+			async execute() {
+				return { content: [{ type: "text", text: "runtime tool ok" }], details: {} };
+			},
+		};
+		const adapter = new PiDshLoopAdapter({
+			store: session,
+			context: { systemPrompt: "system", messages: [] },
+			config: {
+				model,
+				toolExecution: "sequential",
+				convertToLlm: asMessages,
+			},
+			streamFn: streamSequence([assistantWithTool(), assistantDone()]),
+			idGenerator: idSequence(),
+			getRuntimeContributions: () => {
+				contributionSnapshots += 1;
+				return { tools: [runtimeTool] };
+			},
+		});
+
+		await adapter.runPrompt({ prompts: [{ role: "user", content: "hi", timestamp: 1 }] });
+
+		expect(contributionSnapshots).toBe(1);
+		const toolStarted = await session.findRecords({ type: "tool_started" });
+		expect(toolStarted).toHaveLength(1);
+		const messages = await session.findEntries({ type: "message", order: "oldestFirst" });
+		expect(JSON.stringify(messages)).toContain("runtime tool ok");
+	});
+
+	it("calls the operation-finished hook after the durable finish record is appended", async () => {
+		const repo = new InMemorySessionRepo();
+		const session = await repo.create({ id: "finish-hook" });
+		let finishHookSawRecord = false;
+		const adapter = new PiDshLoopAdapter({
+			store: session,
+			context: { systemPrompt: "system", messages: [] },
+			config: { model, convertToLlm: asMessages },
+			streamFn: streamOne(assistantDone()),
+			idGenerator: idSequence(),
+			onOperationFinished: async ({ runId, outcome }) => {
+				const records = await session.findRecords({ type: "operation_finished", runId });
+				finishHookSawRecord = records.length === 1 && outcome === "completed";
+			},
+		});
+
+		await adapter.runPrompt({ prompts: [{ role: "user", content: "start", timestamp: 1 }] });
+
+		expect(finishHookSawRecord).toBe(true);
+	});
 });
 
 function idSequence(): () => string {

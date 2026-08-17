@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -282,6 +282,76 @@ describe("readSessionLog", () => {
 		expect(projection.summary.corruptionState).toBe("uncommitted-tail");
 		expect(projection.uncommittedTail).toBe("{");
 	});
+
+	it("classifies query surfaces, compaction links, and extension lifecycle receipts", async () => {
+		const root = await tempRoot();
+		const path = await writeSession(root, "queryable", [
+			header("queryable"),
+			entry({ type: "message", id: "u1", seq: 1, message: { role: "user", content: "shadow me", timestamp: 1 } }),
+			entry({ type: "message", id: "a1", seq: 2, parentId: "u1", message: { role: "assistant", content: "old answer", timestamp: 2 } }),
+			entry({
+				type: "custom",
+				id: "intent-1",
+				seq: 3,
+				parentId: "a1",
+				customType: "extension/intent-scheduled",
+				data: {
+					intentId: "intent-1",
+					sessionId: "queryable",
+					extensionId: "math",
+					revisionId: "rev-1",
+					sourceHash: "sha256:abc",
+					runId: "run-1",
+					toolCallId: "call-ext",
+					requestedAction: "run",
+				},
+			}),
+			entry({
+				type: "compaction",
+				id: "compact-1",
+				seq: 4,
+				parentId: "intent-1",
+				summary: "summarized first turn",
+				retainedTail: [],
+				tokensBefore: 400,
+				details: { shadowedEntryIds: ["u1", "a1"], sourceEntryIds: ["u1", "a1"] },
+			}),
+			entry({
+				type: "custom",
+				id: "started-1",
+				seq: 5,
+				parentId: "compact-1",
+				customType: "extension/started",
+				data: { extensionId: "math", revisionId: "rev-1", sourceHash: "sha256:abc", status: "started" },
+			}),
+			entry({ type: "message", id: "branch-only", seq: 6, parentId: "u1", message: { role: "assistant", content: "side branch", timestamp: 3 } }),
+			{ kind: "lane", seq: 7, lane: "main", leafId: "started-1" },
+		]);
+
+		const projection = await readSessionLog(path);
+
+		expect(projection.events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "u1", surface: "shadowed", derivedSeqs: [4] }),
+				expect.objectContaining({ id: "a1", surface: "shadowed", derivedSeqs: [4] }),
+				expect.objectContaining({
+					id: "compact-1",
+					surface: "current",
+					replacesSeqs: [1, 2],
+					sourceSeqs: [1, 2],
+				}),
+				expect.objectContaining({
+					id: "started-1",
+					category: "extension",
+					label: "extension/started",
+					summary: "Extension math started revision rev-1",
+					surface: "current",
+				}),
+				expect.objectContaining({ id: "branch-only", surface: "log-only" }),
+				expect.objectContaining({ seq: 7, surface: "log-only" }),
+			]),
+		);
+	});
 });
 
 describe("trajectory HTTP server", () => {
@@ -357,6 +427,118 @@ describe("trajectory HTTP server", () => {
 		);
 	});
 
+	it("does not follow session-file symlinks outside the configured root", async () => {
+		const root = await tempRoot();
+		const outside = await tempRoot();
+		const target = await writeSession(outside, "outside", [header("outside")]);
+		await symlink(target, join(root, "leak.jsonl"));
+		const server = await createServer(root);
+
+		await expect(fetchJson(`${server.url}/api/sessions`)).resolves.toEqual({ sessions: [] });
+		await expect(fetch(`${server.url}/api/sessions/leak`)).resolves.toMatchObject({ status: 404 });
+		await expect(fetch(`${server.url}/api/query/search?q=outside`)).resolves.toMatchObject({ status: 200 });
+		await expect(fetchJson(`${server.url}/api/query/search?q=outside`)).resolves.toMatchObject({ results: [] });
+	});
+
+	it("serves read-only search, window, trace, and lineage query endpoints without locking logs", async () => {
+		const root = await tempRoot();
+		const parentPath = await writeSession(root, "parent", [
+			header("parent"),
+			entry({ type: "message", id: "root-u1", seq: 1, message: { role: "user", content: "root context", timestamp: 1 } }),
+		]);
+		const childHeader = { ...header("child"), parentSessionId: "parent" };
+		const childPath = await writeSession(root, "child", [
+			childHeader,
+			entry({ type: "message", id: "u1", seq: 1, message: { role: "user", content: "find extension receipt", timestamp: 1 } }),
+			entry({
+				type: "custom",
+				id: "intent-1",
+				seq: 2,
+				parentId: "u1",
+				customType: "extension/intent-scheduled",
+				data: {
+					intentId: "intent-1",
+					sessionId: "child",
+					extensionId: "math",
+					revisionId: "rev-1",
+					sourceHash: "sha256:abc",
+					runId: "run-1",
+					toolCallId: "call-ext",
+					requestedAction: "run",
+				},
+			}),
+			entry({
+				type: "compaction",
+				id: "compact-1",
+				seq: 3,
+				parentId: "intent-1",
+				summary: "extension receipt summary",
+				retainedTail: [],
+				tokensBefore: 100,
+				details: { shadowedEntryIds: ["u1"], sourceEntryIds: ["u1"] },
+			}),
+			entry({
+				type: "custom",
+				id: "started-1",
+				seq: 4,
+				parentId: "compact-1",
+				customType: "extension/started",
+				data: { extensionId: "math", revisionId: "rev-1", sourceHash: "sha256:abc", status: "started" },
+			}),
+			{ kind: "lane", seq: 5, lane: "main", leafId: "started-1" },
+		]);
+		const server = await createServer(root);
+
+		await expect(fetchJson(`${server.url}/api/query/search?q=math&session=child`)).resolves.toMatchObject({
+			query: "math",
+			results: [
+				expect.objectContaining({
+					sessionId: "child",
+					event: expect.objectContaining({ seq: 2, surface: "current", category: "extension" }),
+					citation: { sessionId: "child", seq: 2, line: 3 },
+				}),
+				expect.objectContaining({
+					sessionId: "child",
+					event: expect.objectContaining({ seq: 4, surface: "current", category: "extension" }),
+				}),
+			],
+		});
+		await expect(fetchJson(`${server.url}/api/query/search?q=find&surface=shadowed`)).resolves.toMatchObject({
+			results: [expect.objectContaining({ event: expect.objectContaining({ seq: 1, surface: "shadowed" }) })],
+		});
+		await expect(fetchJson(`${server.url}/api/sessions/child/events/3/window?before=1&after=1`)).resolves.toMatchObject({
+			sessionId: "child",
+			centerSeq: 3,
+			events: [
+				expect.objectContaining({ seq: 2 }),
+				expect.objectContaining({ seq: 3 }),
+				expect.objectContaining({ seq: 4 }),
+			],
+		});
+		await expect(fetchJson(`${server.url}/api/sessions/child/events/3/trace`)).resolves.toMatchObject({
+			sessionId: "child",
+			center: expect.objectContaining({ seq: 3 }),
+			events: expect.arrayContaining([
+				expect.objectContaining({ seq: 1, surface: "shadowed" }),
+				expect.objectContaining({ seq: 3, replacesSeqs: [1] }),
+			]),
+		});
+		await expect(fetchJson(`${server.url}/api/sessions/child/lineage`)).resolves.toMatchObject({
+			sessionId: "child",
+			lineage: [
+				expect.objectContaining({ id: "child", parentSessionId: "parent", state: "current" }),
+				expect.objectContaining({ id: "parent", state: "available" }),
+			],
+		});
+
+		await expect(readFile(sessionLockPath(parentPath), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(readFile(sessionLockPath(childPath), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fetch(`${server.url}/api/sessions/%2e%2e/events/1/window`)).resolves.toSatisfy(
+			(response: Response) => response.status === 400 || response.status === 404,
+		);
+		await expect(fetch(`${server.url}/api/query/search?session=%2e%2e%2fpackage&q=x`)).resolves.toMatchObject({ status: 400 });
+	});
+
 	it("serves only bundled static assets with expected content types and landmarks", async () => {
 		const root = await tempRoot();
 		const server = await createServer(root);
@@ -369,6 +551,7 @@ describe("trajectory HTTP server", () => {
 		const traversal = await fetch(`${server.url}/%2e%2e/package.json`);
 
 		expect(shell.headers.get("content-type")).toContain("text/html");
+		expect(shell.headers.get("content-security-policy")).toContain("default-src 'self'");
 		expect(html).toContain("id=\"session-list\"");
 		expect(html).toContain("id=\"view-chat\"");
 		expect(html).toContain("id=\"view-trajectory\"");
@@ -376,11 +559,21 @@ describe("trajectory HTTP server", () => {
 		expect(html).toContain("id=\"event-search\"");
 		expect(html).toContain("id=\"event-list\"");
 		expect(html).toContain("id=\"event-detail\"");
+		expect(html).toContain("id=\"query-search\"");
+		expect(html).toContain("id=\"surface-filter\"");
+		expect(html).not.toMatch(/approve|run extension|stop extension/i);
 		expect(script.headers.get("content-type")).toContain("javascript");
 		expect(style.headers.get("content-type")).toContain("text/css");
 		expect(missing.status).toBe(404);
 		expect([400, 404]).toContain(traversal.status);
 		expect(await traversal.text()).not.toContain("\"name\": \"pi-dsh\"");
+	});
+
+	it("requires explicit opt-in before binding the unauthenticated viewer remotely", async () => {
+		const root = await tempRoot();
+		await expect(startTrajectoryServer({ sessionsRoot: root, host: "0.0.0.0", port: 0 })).rejects.toThrow(
+			"Refusing non-loopback viewer host",
+		);
 	});
 
 	it("emits an initial SSE ready event and a change event after the selected log changes", async () => {

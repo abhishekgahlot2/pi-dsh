@@ -57,7 +57,7 @@ export class DurableSessionHandle {
 export class DurableSessionRepository {
 	constructor(
 		private readonly fs: DurableJsonlFileSystem,
-		private readonly sessionsRoot: string,
+		readonly sessionsRoot: string,
 	) {}
 
 	async create(options: DurableSessionCreateOptions): Promise<DurableSessionHandle> {

@@ -31,7 +31,12 @@ import type {
 } from "../vendor/pi/harness/session/types.ts";
 import { buildRepairSafeSessionContext } from "./repair.ts";
 import { foldConstraints } from "./constraints.ts";
-import { effectiveRequestSnapshot, REQUEST_HEADER_TYPE, stripUndefinedJson } from "./request-snapshot.ts";
+import {
+	effectiveRequestSnapshot,
+	REQUEST_HEADER_TYPE,
+	stripUndefinedJson,
+	type PromptContribution,
+} from "./request-snapshot.ts";
 
 export { REQUEST_HEADER_TYPE } from "./request-snapshot.ts";
 
@@ -49,6 +54,7 @@ export interface PiDshAdapterOptions {
 	config: AgentLoopConfig;
 	streamFn: StreamFn;
 	idGenerator?: () => string;
+	getRuntimeContributions?: () => RuntimeContributionSnapshot | Promise<RuntimeContributionSnapshot>;
 	replayForTool?: (context: BeforeToolCallContext) => ToolStartedRecord["replay"];
 	onEvent?: AgentEventSink;
 	onLoopResult?: (context: {
@@ -56,6 +62,7 @@ export interface PiDshAdapterOptions {
 		messages: AgentMessage[];
 		continueRun: () => Promise<AgentMessage[]>;
 	}) => Promise<AgentMessage[]>;
+	onOperationFinished?: (context: OperationFinishedHookContext) => void | Promise<void>;
 }
 
 export interface RunPromptOptions {
@@ -65,6 +72,17 @@ export interface RunPromptOptions {
 
 export interface ContinueOptions {
 	signal?: AbortSignal;
+}
+
+export interface RuntimeContributionSnapshot {
+	tools?: AgentTool[];
+	promptContributors?: PromptContribution[];
+}
+
+export interface OperationFinishedHookContext {
+	runId: string;
+	outcome: OperationFinishedRecord["outcome"];
+	error?: OperationFinishedRecord["error"];
 }
 
 interface PreparedMessageEntry {
@@ -78,9 +96,11 @@ export class PiDshLoopAdapter {
 	private readonly baseConfig: AgentLoopConfig;
 	private readonly streamFn: StreamFn;
 	private readonly nextId: () => string;
+	private readonly getRuntimeContributions: () => RuntimeContributionSnapshot | Promise<RuntimeContributionSnapshot>;
 	private readonly replayForTool: (context: BeforeToolCallContext) => ToolStartedRecord["replay"];
 	private readonly onEvent: AgentEventSink;
 	private readonly onLoopResult: PiDshAdapterOptions["onLoopResult"];
+	private readonly onOperationFinished: PiDshAdapterOptions["onOperationFinished"];
 	private readonly preparedMessages = new WeakMap<object, PreparedMessageEntry>();
 	private readonly messageEntryIds = new WeakMap<object, string>();
 	private readonly toolResultEntryIdsByCallId = new Map<string, string>();
@@ -96,13 +116,16 @@ export class PiDshLoopAdapter {
 		this.baseConfig = options.config;
 		this.streamFn = options.streamFn;
 		this.nextId = options.idGenerator ?? uuidv7;
+		this.getRuntimeContributions = options.getRuntimeContributions ?? (() => ({}));
 		this.replayForTool = options.replayForTool ?? (() => "never");
 		this.onEvent = options.onEvent ?? (() => undefined);
 		this.onLoopResult = options.onLoopResult;
+		this.onOperationFinished = options.onOperationFinished;
 	}
 
 	async runPrompt(options: RunPromptOptions): Promise<AgentMessage[]> {
 		const runId = this.nextId();
+		const runtimeContributions = await this.snapshotRuntimeContributions();
 		const sourceLeafId = await this.mainLeafId();
 		const initialMessages = options.prompts.map((message) => this.prepareMessage(message).entry);
 		await this.startRun(runId, sourceLeafId, {
@@ -113,17 +136,19 @@ export class PiDshLoopAdapter {
 		return this.runWithOperation(runId, options.signal, () =>
 			runAgentLoop(
 				options.prompts,
-				this.contextForRun(cloneAgentContext(this.baseContext)),
+				this.contextForRun(cloneAgentContext(this.baseContext), runtimeContributions),
 				this.wrapConfig(),
 				this.persistingEventSink(),
 				options.signal,
-				this.snapshottingStreamFn(),
+				this.snapshottingStreamFn(runtimeContributions),
 			),
+			runtimeContributions,
 		);
 	}
 
 	async continue(options: ContinueOptions = {}): Promise<AgentMessage[]> {
 		const runId = this.nextId();
+		const runtimeContributions = await this.snapshotRuntimeContributions();
 		const entries = await this.mainBranchEntries();
 		const sessionContext = buildRepairSafeSessionContext(entries);
 		const sourceLeafId = await this.mainLeafId();
@@ -132,24 +157,31 @@ export class PiDshLoopAdapter {
 			originalPrompt: [],
 			initialMessages: [],
 		});
-		return this.runWithOperation(runId, options.signal, () => this.continueActiveRun(sessionContext.messages, options.signal));
+		return this.runWithOperation(
+			runId,
+			options.signal,
+			() => this.continueActiveRun(sessionContext.messages, options.signal, runtimeContributions),
+			runtimeContributions,
+		);
 	}
 
 	private async runWithOperation(
 		runId: string,
 		signal: AbortSignal | undefined,
 		operation: () => Promise<AgentMessage[]>,
+		runtimeContributions: RuntimeContributionSnapshot,
 	): Promise<AgentMessage[]> {
 		this.activeRunId = runId;
 		this.currentAssistantEntryId = null;
 		this.nextAssistantAttempt = 1;
+		let finishHookContext: OperationFinishedHookContext | undefined;
 		try {
 			let messages = await operation();
 			if (this.onLoopResult !== undefined) {
 				messages = await this.onLoopResult({
 					runId,
 					messages,
-					continueRun: async () => this.continueActiveRun(undefined, signal),
+					continueRun: async () => this.continueActiveRun(undefined, signal, runtimeContributions),
 				});
 			}
 			const terminal = messages.findLast((message) => message.role === "assistant");
@@ -157,24 +189,26 @@ export class PiDshLoopAdapter {
 				signal?.aborted === true || (terminal?.role === "assistant" && terminal.stopReason === "aborted")
 					? "aborted"
 					: terminal?.role === "assistant" && terminal.stopReason === "error"
-						? "failed"
-						: "completed";
-			await this.finishRun(
-				runId,
-				outcome,
+					? "failed"
+					: "completed";
+			const error =
 				outcome === "failed"
 					? { code: "PROVIDER_ERROR", message: terminal?.role === "assistant" ? terminal.errorMessage ?? "provider error" : "provider error" }
-					: undefined,
-			);
+					: undefined;
+			await this.finishRun(runId, outcome, error);
+			finishHookContext = { runId, outcome, ...(error === undefined ? {} : { error }) };
+			await this.onOperationFinished?.(finishHookContext);
 			return messages;
 		} catch (error) {
-			await this.finishRun(
-				runId,
-				signal?.aborted === true ? "aborted" : "failed",
-				signal?.aborted === true
-					? { code: "ABORTED", message: "operation aborted" }
-					: { code: "LOOP_ERROR", message: error instanceof Error ? error.message : String(error) },
-			);
+			if (finishHookContext === undefined) {
+				const outcome = signal?.aborted === true ? "aborted" : "failed";
+				const finishError =
+					signal?.aborted === true
+						? { code: "ABORTED", message: "operation aborted" }
+						: { code: "LOOP_ERROR", message: error instanceof Error ? error.message : String(error) };
+				await this.finishRun(runId, outcome, finishError);
+				await this.onOperationFinished?.({ runId, outcome, error: finishError });
+			}
 			throw error;
 		} finally {
 			this.activeRunId = null;
@@ -185,18 +219,19 @@ export class PiDshLoopAdapter {
 	private async continueActiveRun(
 		messages: AgentMessage[] | undefined,
 		signal: AbortSignal | undefined,
+		runtimeContributions: RuntimeContributionSnapshot,
 	): Promise<AgentMessage[]> {
 		const durableMessages = messages ?? buildRepairSafeSessionContext(await this.mainBranchEntries()).messages;
 		return runAgentLoopContinue(
 			{
 				systemPrompt: this.baseContext.systemPrompt,
-				tools: this.wrapTools(this.baseContext.tools),
+				tools: this.wrapTools(this.combinedTools(this.baseContext.tools, runtimeContributions.tools)),
 				messages: durableMessages,
 			},
 			this.wrapConfig(),
 			this.persistingEventSink(),
 			signal,
-			this.snapshottingStreamFn(),
+			this.snapshottingStreamFn(runtimeContributions),
 		);
 	}
 
@@ -432,8 +467,14 @@ export class PiDshLoopAdapter {
 			: this.store.findEntriesOnBranch({ start: leafId, order: "oldestFirst" });
 	}
 
-	private contextForRun(context: AgentContext): AgentContext {
-		return { ...context, tools: this.wrapTools(context.tools) };
+	private contextForRun(context: AgentContext, runtimeContributions: RuntimeContributionSnapshot): AgentContext {
+		return { ...context, tools: this.wrapTools(this.combinedTools(context.tools, runtimeContributions.tools)) };
+	}
+
+	private combinedTools(baseTools: AgentTool[] | undefined, runtimeTools: AgentTool[] | undefined): AgentTool[] | undefined {
+		if (runtimeTools === undefined || runtimeTools.length === 0) return baseTools;
+		if (baseTools === undefined || baseTools.length === 0) return [...runtimeTools];
+		return [...baseTools, ...runtimeTools];
 	}
 
 	private wrapTools(tools: AgentTool[] | undefined): AgentTool[] | undefined {
@@ -449,10 +490,16 @@ export class PiDshLoopAdapter {
 		}));
 	}
 
-	private snapshottingStreamFn(): StreamFn {
+	private snapshottingStreamFn(runtimeContributions: RuntimeContributionSnapshot): StreamFn {
 		return async (model, context, options) => {
 			const branchEntries = await this.mainBranchEntries();
-			const snapshot = effectiveRequestSnapshot(model, context, options, foldConstraints(branchEntries));
+			const snapshot = effectiveRequestSnapshot(
+				model,
+				context,
+				options,
+				foldConstraints(branchEntries),
+				runtimeContributions.promptContributors,
+			);
 			await this.store.appendEntry(
 				{
 					type: "custom",
@@ -463,6 +510,17 @@ export class PiDshLoopAdapter {
 				"main",
 			);
 			return this.streamFn(model, snapshot.context, options);
+		};
+	}
+
+	private async snapshotRuntimeContributions(): Promise<RuntimeContributionSnapshot> {
+		const snapshot = await this.getRuntimeContributions();
+		return {
+			tools: snapshot.tools === undefined ? undefined : [...snapshot.tools],
+			promptContributors:
+				snapshot.promptContributors === undefined
+					? undefined
+					: snapshot.promptContributors.map((contributor) => structuredClone(contributor)),
 		};
 	}
 }

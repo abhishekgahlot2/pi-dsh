@@ -3,9 +3,17 @@
 // read-only JSONL decoding rather than writable session storage.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { watch, type FSWatcher } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { lstat, readFile, stat } from "node:fs/promises";
 import { extname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	getSessionEventWindow,
+	getSessionLineage,
+	searchSessionEvents,
+	SessionQueryError,
+	traceSessionEvent as traceSessionQueryEvent,
+	type SessionEventSurface,
+} from "../src/session-query.ts";
 import {
 	discoverSessionSummaries,
 	isSafeSessionId,
@@ -17,6 +25,7 @@ export interface TrajectoryServerOptions {
 	staticRoot?: string;
 	host?: string;
 	port?: number;
+	allowRemote?: boolean;
 }
 
 export interface TrajectoryServer {
@@ -43,6 +52,7 @@ const DEFAULT_PORT = 8787;
 const DEFAULT_STATIC_ROOT = fileURLToPath(new URL("./app", import.meta.url));
 const HARDENING_HEADERS = {
 	"Cache-Control": "no-store",
+	"Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
 	"X-Content-Type-Options": "nosniff",
 	"Cross-Origin-Resource-Policy": "same-origin",
 	"Referrer-Policy": "no-referrer",
@@ -71,6 +81,9 @@ export function createTrajectoryHttpServer(options: TrajectoryServerOptions = {}
 
 export async function startTrajectoryServer(options: TrajectoryServerOptions = {}): Promise<TrajectoryServer> {
 	const host = options.host ?? DEFAULT_HOST;
+	if (!isLoopbackHost(host) && options.allowRemote !== true) {
+		throw new Error("Refusing non-loopback viewer host without --allow-remote; the viewer has no authentication");
+	}
 	const port = options.port ?? DEFAULT_PORT;
 	const sessionsRoot = resolve(options.sessionsRoot ?? process.env.PIDSH_SESSIONS_ROOT ?? ".pi-dsh/sessions");
 	const staticRoot = resolve(options.staticRoot ?? DEFAULT_STATIC_ROOT);
@@ -111,6 +124,20 @@ async function handleRequest(state: ServerState, request: IncomingMessage, respo
 			sendJson(response, 200, { sessions }, {}, method === "HEAD");
 			return;
 		}
+		if (requestUrl.pathname === "/api/query/search") {
+			const parsed = parseSearchQuery(requestUrl);
+			if ("error" in parsed) {
+				sendJson(response, 400, { error: parsed.error });
+				return;
+			}
+			const results = await searchSessionEvents(state.sessionsRoot, {
+				text: parsed.query,
+				limit: parsed.limit,
+				filters: { sessionId: parsed.sessionId, eventSurface: parsed.surface },
+			});
+			sendJson(response, 200, { query: parsed.query, ...results }, {}, method === "HEAD");
+			return;
+		}
 		const sessionRoute = parseSessionRoute(rawPathname);
 		if (sessionRoute !== undefined) {
 			const decoded = decodeRouteId(sessionRoute.encodedId);
@@ -124,7 +151,7 @@ async function handleRequest(state: ServerState, request: IncomingMessage, respo
 				return;
 			}
 			const path = join(state.sessionsRoot, `${decoded}.jsonl`);
-			if (sessionRoute.events) {
+			if (sessionRoute.kind === "sse") {
 				if (method === "HEAD") {
 					writeHeaders(response, 200, { "Content-Type": "text/event-stream" });
 					response.end();
@@ -133,21 +160,66 @@ async function handleRequest(state: ServerState, request: IncomingMessage, respo
 				openSse(state, request, response, path);
 				return;
 			}
+			if (sessionRoute.kind === "lineage") {
+				const lineage = await getSessionLineage(state.sessionsRoot, decoded);
+				sendJson(response, 200, {
+					...lineage,
+					lineage: [
+						{ id: decoded, parentSessionId: lineage.ancestors[0]?.sessionId, state: "current", citation: { line: 1 } },
+						...lineage.ancestors.map((item) => ({ id: item.sessionId, parentSessionId: item.parentSessionId, state: item.resolved ? "available" : "unresolved", citation: item.citation })),
+						...lineage.descendants.map((item) => ({ id: item.sessionId, parentSessionId: item.parentSessionId, state: "descendant", citation: item.citation })),
+					],
+				}, {}, method === "HEAD");
+				return;
+			}
+			if (sessionRoute.kind === "window") {
+				const window = await getSessionEventWindow(state.sessionsRoot, decoded, sessionRoute.seq, {
+					before: integerQuery(requestUrl, "before", 5, 0, 100),
+					after: integerQuery(requestUrl, "after", 5, 0, 100),
+				});
+				sendJson(response, 200, { sessionId: decoded, centerSeq: sessionRoute.seq, ...window.bounds, events: window.events }, {}, method === "HEAD");
+				return;
+			}
+			if (sessionRoute.kind === "trace") {
+				const trace = await traceSessionQueryEvent(state.sessionsRoot, decoded, sessionRoute.seq);
+				const center = {
+					...trace.target,
+					replacesSeqs: trace.relationships.filter((relationship) => relationship.type === "compaction-replacement").map((relationship) => relationship.target.seq),
+					sourceSeqs: trace.relationships.filter((relationship) => relationship.type === "compaction-source").map((relationship) => relationship.target.seq),
+					derivedSeqs: trace.relationships.filter((relationship) => relationship.type === "compaction-derived").map((relationship) => relationship.target.seq),
+				};
+				const events = [center, ...trace.relationships.map((relationship) => relationship.target)]
+					.filter((event, index, all) => all.findIndex((candidate) => candidate.seq === event.seq) === index)
+					.toSorted((left, right) => left.seq - right.seq);
+				sendJson(response, 200, { sessionId: decoded, center, events, relationships: trace.relationships }, {}, method === "HEAD");
+				return;
+			}
 			const session = await readSessionLogFile(path, { fallbackId: decoded });
 			sendJson(response, 200, session, {}, method === "HEAD");
 			return;
 		}
 		await serveStatic(state.staticRoot, requestUrl.pathname, response, method === "HEAD");
 	} catch (error) {
+		if (error instanceof SessionQueryError) {
+			sendJson(response, error.code === "SESSION_QUERY_NOT_FOUND" ? 404 : 400, { error: error.code, message: error.message });
+			return;
+		}
 		const message = error instanceof Error ? error.message : String(error);
 		sendJson(response, 500, { error: "internal_error", message });
 	}
 }
 
-function parseSessionRoute(pathname: string): { encodedId: string; events: boolean } | undefined {
+type SessionRoute =
+	| { encodedId: string; kind: "detail" }
+	| { encodedId: string; kind: "sse" }
+	| { encodedId: string; kind: "lineage" }
+	| { encodedId: string; kind: "window"; seq: number }
+	| { encodedId: string; kind: "trace"; seq: number };
+
+function parseSessionRoute(pathname: string): SessionRoute | undefined {
 	const parts = pathname.split("/");
 	if (parts.length === 4 && parts[1] === "api" && parts[2] === "sessions" && parts[3] !== "") {
-		return { encodedId: parts[3]!, events: false };
+		return { encodedId: parts[3]!, kind: "detail" };
 	}
 	if (
 		parts.length === 5 &&
@@ -156,9 +228,72 @@ function parseSessionRoute(pathname: string): { encodedId: string; events: boole
 		parts[3] !== "" &&
 		parts[4] === "events"
 	) {
-		return { encodedId: parts[3]!, events: true };
+		return { encodedId: parts[3]!, kind: "sse" };
+	}
+	if (
+		parts.length === 5 &&
+		parts[1] === "api" &&
+		parts[2] === "sessions" &&
+		parts[3] !== "" &&
+		parts[4] === "lineage"
+	) {
+		return { encodedId: parts[3]!, kind: "lineage" };
+	}
+	if (
+		parts.length === 7 &&
+		parts[1] === "api" &&
+		parts[2] === "sessions" &&
+		parts[3] !== "" &&
+		parts[4] === "events" &&
+		parts[6] === "window"
+	) {
+		const seq = parseRouteSeq(parts[5]!);
+		return seq === undefined ? undefined : { encodedId: parts[3]!, kind: "window", seq };
+	}
+	if (
+		parts.length === 7 &&
+		parts[1] === "api" &&
+		parts[2] === "sessions" &&
+		parts[3] !== "" &&
+		parts[4] === "events" &&
+		parts[6] === "trace"
+	) {
+		const seq = parseRouteSeq(parts[5]!);
+		return seq === undefined ? undefined : { encodedId: parts[3]!, kind: "trace", seq };
 	}
 	return undefined;
+}
+
+function parseRouteSeq(raw: string): number | undefined {
+	if (!/^\d+$/.test(raw)) return undefined;
+	const seq = Number(raw);
+	return Number.isSafeInteger(seq) ? seq : undefined;
+}
+
+function parseSearchQuery(
+	requestUrl: URL,
+): { query: string; sessionId?: string; surface?: SessionEventSurface; limit?: number } | { error: string } {
+	const query = requestUrl.searchParams.get("q") ?? "";
+	const sessionId = requestUrl.searchParams.get("session") ?? undefined;
+	if (sessionId !== undefined && !isSafeSessionId(sessionId)) return { error: "invalid_session_id" };
+	const surface = requestUrl.searchParams.get("surface") ?? undefined;
+	if (surface !== undefined && surface !== "current" && surface !== "shadowed" && surface !== "log-only") {
+		return { error: "invalid_surface" };
+	}
+	return {
+		query,
+		...(sessionId === undefined ? {} : { sessionId }),
+		...(surface === undefined ? {} : { surface }),
+		limit: integerQuery(requestUrl, "limit", 50, 1, 200),
+	};
+}
+
+function integerQuery(requestUrl: URL, key: string, fallback: number, min: number, max: number): number {
+	const value = requestUrl.searchParams.get(key);
+	if (value === null || value === "") return fallback;
+	const parsed = Number(value);
+	if (!Number.isInteger(parsed)) return fallback;
+	return Math.min(max, Math.max(min, parsed));
 }
 
 function decodeRouteId(encoded: string): string | undefined {
@@ -247,7 +382,7 @@ async function serveStatic(staticRoot: string, pathname: string, response: Serve
 		return;
 	}
 	try {
-		const fileStat = await stat(filePath);
+		const fileStat = await lstat(filePath);
 		if (!fileStat.isFile()) {
 			sendText(response, 404, "not found");
 			return;
@@ -368,11 +503,18 @@ export function parseServerArgs(args: readonly string[]): TrajectoryServerOption
 			case "--static-root":
 				options.staticRoot = readValue();
 				break;
+			case "--allow-remote":
+				options.allowRemote = true;
+				break;
 			default:
 				throw new Error(`Unknown option: ${arg}`);
 		}
 	}
 	return options;
+}
+
+function isLoopbackHost(host: string): boolean {
+	return host === "127.0.0.1" || host === "::1" || host === "localhost";
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

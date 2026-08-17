@@ -2,13 +2,12 @@
 
 A minimal personal coding-agent harness with Pi's readable agent loop and tools on top of a
 durable, event-sourced session engine. It ports selected failure semantics from DeepSeek Harness
-(dsh) as executable tests without adopting dsh's plugin runtime or event vocabulary.
+(dsh) as executable tests without adopting Cordis or dsh's event vocabulary.
 
 ![pi-dsh durable trajectory viewer](docs/assets/trajectory.png)
 
-The distinguishing feature is durable session constraints: explicit instructions are stored as
-first-class events and reconstructed for every provider request, so compaction does not silently
-remove them.
+The distinguishing features are approval-gated host self-extension, causally queryable session
+history, and durable constraints that survive compaction and restart.
 
 ## Status
 
@@ -20,10 +19,13 @@ Implemented:
 - durable tool-start checkpoints and append-only interrupted-run repair
 - closed-prefix transactional compaction with provenance
 - durable add/revoke constraint events
+- one typed component graph with dependency activation, reversible effects, and idle replacement
+- model-facing session search, event windows, direct causal traces, and session lineage
+- approval-gated process-local host extensions with worker-thread preemption
 - create, resume, steer, follow-up, abort, fork, compact, and subscribe APIs
-- dependency-free local trajectory viewer with Chat/Trajectory views and live SSE updates
+- dependency-free trajectory viewer with surface filters, causal inspection, and live SSE updates
 
-The strict typecheck and 93 local tests pass. The paid constraint-adherence benchmark and a live
+The strict typecheck and 138 local tests pass. The paid constraint-adherence benchmark and a live
 provider crash smoke test are still product-validation gates; the local suite does not substitute
 for them.
 
@@ -57,9 +59,9 @@ npm run check
 npm test
 ```
 
-Expected result at this revision: 13 test files and 93 passing tests, including Pi storage
-conformance, crash durability, repair races, compaction, constraints, API lifecycle, and web/SSE
-coverage.
+Expected result at this revision: 18 test files and 138 passing tests, including Pi storage
+conformance, crash durability, repair races, component rollback, worker preemption, self-extension,
+causal query, compaction, constraints, API lifecycle, and web/SSE coverage.
 
 To verify that the committed Pi subset still matches the pinned upstream submodule:
 
@@ -91,9 +93,27 @@ The CLI prints the session ID. Supported commands include:
 ```text
 /constraint add <id> <instruction>
 /constraint revoke <id>
+/extension inspect
+/extension approve <extension-id> <revision-id> <source-hash>
+/extension run <extension-id> <revision-id>
+/extension stop <extension-id>
+/extension rollback <extension-id> <revision-id>
+/extension remove <extension-id>
 /compact
 /quit
 ```
+
+The model receives read-only history tools (`session_search`, `session_event_window`,
+`session_trace`, `session_lineage`) and extension lifecycle tools (`extension_inspect`,
+`extension_define`, `extension_run`, `extension_stop`, `extension_update`,
+`extension_rollback`, `extension_remove`). Model lifecycle calls schedule work for the next turn;
+they never mutate the active request's tool/prompt snapshot.
+
+`extension_define` records a model-authored host function and returns after the operation's
+post-run drain creates an immutable revision. Use `/extension inspect` to read its revision and
+source hash, approve that exact pair, then ask the model to run it in a later turn. Extension
+source is durable in assistant tool-call history. Definitions and workers are process-local and
+are not restored after restart.
 
 Resume an existing session:
 
@@ -116,7 +136,8 @@ npm run web
 
 Open <http://127.0.0.1:8787>. The viewer shows sessions, model-visible chat, the complete durable
 event ledger, request snapshots, tool checkpoints/results, constraints, compaction, repair,
-usage, payload schemas, correlations, and live file updates.
+usage, payload schemas, `current`/`shadowed`/`log-only` surfaces, cross-session search, event
+windows, causal relationships, session lineage, extension receipts, and live file updates.
 
 For a non-default session directory:
 
@@ -125,33 +146,43 @@ npm run web -- --sessions-root /absolute/path/to/sessions
 ```
 
 The viewer never opens writable session storage, acquires a session writer lock, or repairs the
-log. Prompting remains in the CLI so the single-writer contract is preserved.
+log. It binds to loopback by default and refuses a remote host unless `--allow-remote` is supplied;
+remote mode has no authentication and should be placed behind a trusted access layer. Prompting
+and extension approval remain in the CLI so the single-writer contract is preserved.
 
 ## Architecture
 
 - `src/` — durable engine, adapters, public API, provider wiring, and CLI
+- `src/component-kernel.ts` — bounded component lifecycle and idle replacement
+- `src/session-query.ts` — bounded search, window, causal trace, and lineage service
+- `src/extensions.ts` + `src/extension-worker.ts` — approval and worker lifecycle
 - `test/` — regression, crash-injection, conformance, and web/SSE tests
 - `web/` — dependency-free read-only trajectory server and browser UI
 - `vendor/pi/` — machine-synced Pi subset; never hand-edit
 - `upstream/pi-mono/` and `upstream/deepseek-harness/` — pinned reference submodules
 
-dsh code is not vendored. It contributes failure semantics and test intent. Pi remains
-the only runtime session model, while provider, tools, execution environment, and storage are
-replaceable through explicit composition and process restart.
+dsh code is not vendored. It contributes failure semantics and test intent. Pi remains the only
+runtime session model. See [docs/architecture.md](docs/architecture.md) for component, query,
+self-extension, trust, and lifecycle contracts.
 
 ## Deliberate limits and known gaps
 
 - one writer per session; no concurrent writers or multi-lane orchestration
 - the web viewer is read-only
+- arbitrary browser/client extensions are not supported
+- approved host extension JavaScript is trusted local code; worker + VM boundaries provide
+  lifecycle preemption, not a security boundary
+- extension definitions are process-local and their submitted source remains in durable assistant
+  tool-call history
+- provider is graph-visible but non-replaceable; other component replacement is idle-only
 - an interrupted side-effecting tool can be classified as `OUTCOME_UNKNOWN`, but external-state
   reconciliation remains tool/operator policy rather than a universally enforceable guarantee
 - constraint changes are currently accepted only while the public session API is idle
 - proactive compaction estimates transcript messages, not the entire fixed request prefix
 - arbitrary `prepareNextTurn` message changes are not copied into the durable request snapshot
 
-See [plan.md](plan.md) and [review.md](review.md) for the decision record and remaining
-product-validation work. Private behavioral design notes are ignored; executable tests are the
-public contract.
+Private behavioral design and planning notes are ignored; executable tests and
+[docs/architecture.md](docs/architecture.md) are the public contract.
 
 ## Secrets and local data
 

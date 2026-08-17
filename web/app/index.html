@@ -65,8 +65,23 @@
 					<input id="event-search" type="search" placeholder="Search payloads, ids, tools…" autocomplete="off">
 					<kbd>/</kbd>
 				</label>
+				<label class="search-box query-search">
+					<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h7"/><circle cx="18" cy="17" r="2"/></svg>
+					<span class="sr-only">Query session graph</span>
+					<input id="query-search" type="search" placeholder="Query citations…" autocomplete="off">
+				</label>
+				<label class="surface-select">
+					<span class="sr-only">Surface filter</span>
+					<select id="surface-filter">
+						<option value="all">all surfaces</option>
+						<option value="current">current</option>
+						<option value="shadowed">shadowed</option>
+						<option value="log-only">log-only</option>
+					</select>
+				</label>
 				<div id="event-filters" class="event-filters" aria-label="Event filters"></div>
 			</div>
+			<div id="query-results" class="query-results" aria-live="polite"></div>
 
 			<section class="ledger" aria-label="Trajectory timeline">
 				<div class="ledger-ruler" aria-hidden="true"><span>seq</span><span>durable event</span><span>time</span></div>

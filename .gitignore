@@ -16,3 +16,7 @@ dist/
 
 # Private behavioral design notes; executable tests are the public contract.
 spec/
+
+# Local planning/review artifacts; public architecture lives under docs/.
+/plan.md
+/review.md

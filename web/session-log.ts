@@ -1,7 +1,7 @@
 // Read-only Pi v4 log projection for the Stage 7 trajectory viewer.
 // The viewer decodes durable JSONL directly so it never opens writable storage
 // or participates in the engine's single-writer lifecycle.
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat, readdir, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { parseHeader, parseMutation } from "../vendor/pi/harness/session/jsonl/codec.ts";
 import type { JsonlV4Header } from "../vendor/pi/harness/session/jsonl.ts";
@@ -18,11 +18,14 @@ export type TrajectoryCategory =
 	| "assistant"
 	| "tool"
 	| "constraint"
+	| "extension"
 	| "compaction"
 	| "repair"
 	| "queue"
 	| "usage"
 	| "record";
+
+export type EventSurface = "current" | "shadowed" | "log-only";
 
 export interface SessionParseIssue {
 	line: number;
@@ -46,6 +49,7 @@ export interface ProjectedEvent {
 	line: number;
 	kind: SessionMutation["kind"];
 	category: TrajectoryCategory;
+	surface?: EventSurface;
 	label: string;
 	summary: string;
 	timestamp?: number;
@@ -56,6 +60,9 @@ export interface ProjectedEvent {
 	parentId?: string | null;
 	toolCallId?: string;
 	correlationId?: string;
+	replacesSeqs?: number[];
+	sourceSeqs?: number[];
+	derivedSeqs?: number[];
 	searchText: string;
 	payload: JsonValue;
 }
@@ -100,7 +107,7 @@ export async function discoverSessionSummaries(sessionsRoot: string): Promise<Se
 				const id = basename(name, ".jsonl");
 				if (!isSafeSessionId(id)) return undefined;
 				const path = join(sessionsRoot, name);
-				const fileStat = await stat(path);
+				const fileStat = await lstat(path);
 				if (!fileStat.isFile()) return undefined;
 				try {
 					const projected = await readSessionLogFile(path, { fallbackId: id });
@@ -129,7 +136,9 @@ export async function readSessionLogFile(
 	path: string,
 	options: { fallbackId?: string } = {},
 ): Promise<ProjectedSessionLog> {
-	const [contents, fileStat] = await Promise.all([readFile(path, "utf8"), stat(path)]);
+	const fileStat = await lstat(path);
+	if (!fileStat.isFile()) throw new Error(`Session path is not a regular file: ${path}`);
+	const contents = await readFile(path, "utf8");
 	const fileId = options.fallbackId ?? basename(path, ".jsonl");
 	const projected = projectSessionLogText(contents, {
 		fallbackId: fileId,
@@ -193,6 +202,7 @@ export function projectSessionLogText(
 		const chatItem = projectChatItem(parsed.value);
 		if (chatItem !== undefined) chat.push(chatItem);
 	}
+	annotateEventSurfaces(events);
 
 	const corruptionState =
 		issues.length > 0 ? "malformed" : uncommittedTail === undefined ? "clean" : "uncommitted-tail";
@@ -283,7 +293,7 @@ function projectEntry(entry: Entry, lane: string | undefined, line: number): Pro
 	}
 	if (entry.type === "custom") {
 		const customType = entry.customType;
-		const category = customType === "request-header" ? "request" : customType.startsWith("constraint/") ? "constraint" : "record";
+		const category = customType === "request-header" ? "request" : customType.startsWith("constraint/") ? "constraint" : customType.startsWith("extension/") ? "extension" : "record";
 		return {
 			seq: entry.seq,
 			line,
@@ -426,7 +436,38 @@ function summarizeCustomEntry(entry: Extract<Entry, { type: "custom" }>): string
 			toolCount === undefined ? "" : ` with ${toolCount} tools`
 		}`;
 	}
+	if (entry.customType.startsWith("extension/")) {
+		return summarizeExtensionEntry(entry.customType, entry.data);
+	}
 	return `${entry.customType}: ${clip(JSON.stringify(entry.data ?? null))}`;
+}
+
+function summarizeExtensionEntry(customType: string, data: unknown): string {
+	const extensionId = stringField(data, "extensionId") ?? "unknown";
+	const revisionId = stringField(data, "revisionId");
+	const action = stringField(data, "requestedAction");
+	switch (customType) {
+		case "extension/intent-scheduled":
+			return `Extension ${extensionId} scheduled ${action ?? "intent"}${revisionId ? ` for revision ${revisionId}` : ""}`;
+		case "extension/defined":
+			return `Extension ${extensionId} defined${revisionId ? ` revision ${revisionId}` : ""}`;
+		case "extension/approved":
+			return `Extension ${extensionId} approved${revisionId ? ` revision ${revisionId}` : ""}`;
+		case "extension/started":
+			return `Extension ${extensionId} started${revisionId ? ` revision ${revisionId}` : ""}`;
+		case "extension/stopped":
+			return `Extension ${extensionId} stopped${revisionId ? ` revision ${revisionId}` : ""}`;
+		case "extension/updated":
+			return `Extension ${extensionId} updated${revisionId ? ` revision ${revisionId}` : ""}`;
+		case "extension/rolled-back":
+			return `Extension ${extensionId} rolled back${revisionId ? ` to revision ${revisionId}` : ""}`;
+		case "extension/removed":
+			return `Extension ${extensionId} removed`;
+		case "extension/failed":
+			return `Extension ${extensionId} failed: ${stringField(data, "code") ?? stringField(data, "errorCode") ?? "unknown"}`;
+		default:
+			return `${customType}: ${clip(JSON.stringify(data ?? null))}`;
+	}
 }
 
 function summarizeRecord(record: LaneRecord): string {
@@ -519,6 +560,64 @@ function searchable(parts: readonly unknown[]): string {
 		.filter((part) => part !== undefined && part !== null)
 		.map((part) => String(part).toLowerCase())
 		.join(" ");
+}
+
+function annotateEventSurfaces(events: ProjectedEvent[]): void {
+	const byId = new Map(events.flatMap((event) => (event.id === undefined ? [] : [[event.id, event] as const])));
+	const bySeq = new Map(events.map((event) => [event.seq, event]));
+	const latestMainLeaf = events.findLast((event) => event.kind === "lane" && event.lane === "main")?.payload;
+	const laneLeafId = objectStringField(latestMainLeaf, "leafId") ?? events.findLast((event) => event.kind === "entry")?.id;
+	const currentIds = new Set<string>();
+	let cursor = laneLeafId;
+	while (cursor !== undefined && !currentIds.has(cursor)) {
+		currentIds.add(cursor);
+		cursor = byId.get(cursor)?.parentId ?? undefined;
+	}
+	const shadowedIds = new Set<string>();
+	const derivedBySeq = new Map<number, number[]>();
+	for (const event of events) {
+		if (event.category !== "compaction") continue;
+		const shadowedEntryIds = stringArrayField(objectField(event.payload, "details"), "shadowedEntryIds");
+		const sourceEntryIds = stringArrayField(objectField(event.payload, "details"), "sourceEntryIds");
+		const replacesSeqs = seqsForIds(byId, shadowedEntryIds);
+		const sourceSeqs = seqsForIds(byId, sourceEntryIds);
+		if (replacesSeqs.length > 0) event.replacesSeqs = replacesSeqs;
+		if (sourceSeqs.length > 0) event.sourceSeqs = sourceSeqs;
+		for (const id of shadowedEntryIds) shadowedIds.add(id);
+		for (const seq of [...new Set([...replacesSeqs, ...sourceSeqs])]) {
+			derivedBySeq.set(seq, [...(derivedBySeq.get(seq) ?? []), event.seq]);
+		}
+	}
+	for (const event of events) {
+		const derivedSeqs = derivedBySeq.get(event.seq);
+		if (derivedSeqs !== undefined) event.derivedSeqs = derivedSeqs.toSorted((left, right) => left - right);
+		if (event.kind !== "entry" || event.id === undefined) {
+			event.surface = "log-only";
+		} else if (shadowedIds.has(event.id)) {
+			event.surface = "shadowed";
+		} else if (currentIds.has(event.id) || bySeq.has(event.seq)) {
+			event.surface = currentIds.has(event.id) ? "current" : "log-only";
+		} else {
+			event.surface = "log-only";
+		}
+	}
+}
+
+function seqsForIds(byId: ReadonlyMap<string, ProjectedEvent>, ids: readonly string[]): number[] {
+	return ids
+		.map((id) => byId.get(id)?.seq)
+		.filter((seq): seq is number => seq !== undefined)
+		.toSorted((left, right) => left - right);
+}
+
+function stringArrayField(value: unknown, field: string): string[] {
+	if (value === null || typeof value !== "object") return [];
+	const fieldValue = (value as Record<string, unknown>)[field];
+	return Array.isArray(fieldValue) ? fieldValue.filter((item): item is string => typeof item === "string") : [];
+}
+
+function objectStringField(value: unknown, field: string): string | undefined {
+	return stringField(value, field);
 }
 
 function clip(value: string | undefined, maxLength = 180): string {

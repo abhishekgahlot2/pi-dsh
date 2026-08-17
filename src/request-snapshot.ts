@@ -6,14 +6,24 @@ import { constraintSectionMessage, type Constraint, renderConstraintSection } fr
 
 export const REQUEST_HEADER_TYPE = "request-header";
 
+export interface PromptContribution {
+	id: string;
+	text: string;
+}
+
 export function effectiveRequestSnapshot(
 	model: Model<Api>,
 	context: Context,
 	options: SimpleStreamOptions | undefined,
 	constraints: readonly Constraint[],
+	promptContributors: readonly PromptContribution[] = [],
 ): { context: Context; data: Record<string, unknown> } {
 	const constraintSection = renderConstraintSection(constraints);
-	const messages = constraintSectionMessage(constraints).filter(isProviderMessage);
+	const promptContributionSection = renderPromptContributionSection(promptContributors);
+	const messages = [
+		...constraintSectionMessage(constraints),
+		...promptContributionSectionMessage(promptContributors),
+	].filter(isProviderMessage);
 	const effectiveContext = { ...context, messages: [...messages, ...context.messages] } satisfies Context;
 	return {
 		context: effectiveContext,
@@ -21,8 +31,10 @@ export function effectiveRequestSnapshot(
 			model: { provider: model.provider, id: model.id, api: model.api },
 			systemPrompt: effectiveContext.systemPrompt,
 			tools: effectiveContext.tools?.map(toolSchemaSnapshot),
+			promptContributors: promptContributors.map(promptContributionSnapshot),
 			options: samplingOptionsSnapshot(options),
 			constraintSection,
+			promptContributionSection,
 		}) as Record<string, unknown>,
 	};
 }
@@ -48,6 +60,27 @@ function toolSchemaSnapshot(tool: Tool): Record<string, unknown> {
 		string,
 		unknown
 	>;
+}
+
+function renderPromptContributionSection(promptContributors: readonly PromptContribution[]): string {
+	if (promptContributors.length === 0) return "";
+	const lines = [
+		"<session-prompt-contributors>",
+		"These active runtime prompt contributions apply to this request:",
+		...promptContributors.map((contributor) => `- ${contributor.id}: ${contributor.text}`),
+		"</session-prompt-contributors>",
+	];
+	return lines.join("\n");
+}
+
+function promptContributionSectionMessage(promptContributors: readonly PromptContribution[], timestamp = 0): AgentMessage[] {
+	const rendered = renderPromptContributionSection(promptContributors);
+	if (!rendered) return [];
+	return [{ role: "user", content: [{ type: "text", text: rendered }], timestamp }];
+}
+
+function promptContributionSnapshot(contributor: PromptContribution): Record<string, unknown> {
+	return stripUndefinedJson({ id: contributor.id, text: contributor.text }) as Record<string, unknown>;
 }
 
 function samplingOptionsSnapshot(options: SimpleStreamOptions | undefined): Record<string, unknown> {
