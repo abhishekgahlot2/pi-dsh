@@ -7,7 +7,7 @@ pi-dsh keeps Pi's readable loop and four coding tools, then adds crash-consisten
 durable constraints, causal history search, a replaceable component graph, approval-gated host
 self-extension, and a read-only trajectory viewer.
 
-![pi-dsh durable trajectory viewer](docs/assets/trajectory.png)
+![pi-dsh durable trajectory viewer](https://abhishekgahlot2.github.io/pi-dsh/docs/assets/trajectory.png)
 
 > **Project status:** experimental personal harness. TypeScript is strict, the Pi vendor tree is
 > conformance-tested, and the current revision passes 138 tests. Approved extension JavaScript is
