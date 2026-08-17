@@ -4,6 +4,8 @@ A minimal personal coding-agent harness with Pi's readable agent loop and tools 
 durable, event-sourced session engine. It ports selected failure semantics from DeepSeek Harness
 (dsh) as executable tests without adopting dsh's plugin runtime or event vocabulary.
 
+![pi-dsh durable trajectory viewer](docs/assets/trajectory.png)
+
 The distinguishing feature is durable session constraints: explicit instructions are stored as
 first-class events and reconstructed for every provider request, so compaction does not silently
 remove them.
