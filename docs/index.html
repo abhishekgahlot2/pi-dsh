@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="pi-dsh adapts Pi's readable coding-agent loop to a crash-consistent, inspectable session engine.">
+  <meta name="theme-color" content="#090b0d">
+  <meta property="og:title" content="pi-dsh — Pi with a durable spine">
+  <meta property="og:description" content="A small adapter that adds crash-consistent sessions, repair semantics, causal history, and approved runtime tools around Pi's agent loop.">
+  <meta property="og:image" content="https://github.com/abhishekgahlot2/pi-dsh/releases/download/v0.0.1/trajectory.png">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://abhishekgahlot2.github.io/pi-dsh/">
+  <link rel="canonical" href="https://abhishekgahlot2.github.io/pi-dsh/">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <title>pi-dsh — Pi with a durable spine</title>
+  <link rel="stylesheet" href="site.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="pi-dsh home">
+      <span class="brand-mark" aria-hidden="true">π</span>
+      <span>
+        <strong>pi-dsh</strong>
+        <small>durable agent adapter</small>
+      </span>
+    </a>
+    <nav aria-label="Primary navigation">
+      <a href="#adapter">The adapter</a>
+      <a href="#guarantees">Guarantees</a>
+      <a href="#inspect">Inspect</a>
+      <a class="nav-cta" href="https://github.com/abhishekgahlot2/pi-dsh">GitHub ↗</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="status-dot"></span> Experimental personal harness</p>
+        <h1>Pi’s loop.<br><span>A durable spine.</span></h1>
+        <p class="lede">
+          pi-dsh keeps Pi’s small, readable coding-agent loop and four tools. It adds the part a
+          long-running agent needs when the process dies: an fsynced event ledger, repair semantics,
+          durable constraints, causal history, and human-approved runtime tools.
+        </p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="#quickstart">Run it locally</a>
+          <a class="button button-secondary" href="https://github.com/abhishekgahlot2/pi-dsh/blob/main/docs/architecture.md">Read the architecture</a>
+        </div>
+        <p class="plain-language"><strong>In plain English:</strong> the agent stays Pi; pi-dsh makes its work recoverable and explainable.</p>
+      </div>
+
+      <div class="turn-card" aria-label="One durable agent turn">
+        <div class="turn-card-header">
+          <span>ONE TURN THROUGH PI-DSH</span>
+          <span class="live-label"><span class="status-dot"></span> durable</span>
+        </div>
+        <ol class="turn-flow">
+          <li>
+            <span class="step-number">01</span>
+            <div><strong>Freeze the effective request</strong><small>model, prompt, tools, constraints</small></div>
+          </li>
+          <li>
+            <span class="step-number">02</span>
+            <div><strong>Run Pi’s agent loop</strong><small>provider stream + read, bash, edit, write</small></div>
+          </li>
+          <li>
+            <span class="step-number">03</span>
+            <div><strong>Checkpoint before side effects</strong><small>tool_started is durable before the body runs</small></div>
+          </li>
+          <li>
+            <span class="step-number">04</span>
+            <div><strong>Append → fsync → acknowledge</strong><small>the ledger advances only after durable write</small></div>
+          </li>
+          <li>
+            <span class="step-number">05</span>
+            <div><strong>Resume without guessing</strong><small>repair records what is known—and what is not</small></div>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="section adapter-section" id="adapter">
+      <div class="section-heading">
+        <p class="eyebrow">THE BOUNDARY</p>
+        <h2>It is an adapter, not a replacement agent.</h2>
+        <p>Pi still decides how a turn runs. pi-dsh owns what must survive and what can be inspected later.</p>
+      </div>
+
+      <div class="architecture" role="img" aria-label="CLI and public API enter the pi-dsh adapter, which coordinates Pi execution and the durable session engine before writing a queryable event ledger.">
+        <div class="arch-node arch-entry">
+          <span>INPUT</span>
+          <strong>CLI / public API</strong>
+        </div>
+        <div class="arch-arrow" aria-hidden="true">↓</div>
+        <div class="arch-node arch-adapter">
+          <span>ADAPTER</span>
+          <strong>PiDshLoopAdapter</strong>
+          <small>snapshots · checkpoints · awaited persistence</small>
+        </div>
+        <div class="arch-split" aria-hidden="true"><span>↙</span><span>↘</span></div>
+        <div class="arch-columns">
+          <div class="arch-node">
+            <span>EXECUTION</span>
+            <strong>Pi loop + tools</strong>
+            <small>streaming · tool calls · messages</small>
+          </div>
+          <div class="arch-node">
+            <span>DURABILITY</span>
+            <strong>Session engine</strong>
+            <small>fsync · repair · compaction · constraints</small>
+          </div>
+        </div>
+        <div class="arch-merge" aria-hidden="true"><span>↘</span><span>↙</span></div>
+        <div class="arch-node arch-ledger">
+          <span>SOURCE OF TRUTH</span>
+          <strong>Pi v4 event ledger</strong>
+          <small>viewer · causal query · restart</small>
+        </div>
+      </div>
+
+      <div class="truth-grid">
+        <article>
+          <p class="truth-label truth-keep">KEPT FROM PI</p>
+          <h3>The behavior you already understand</h3>
+          <ul>
+            <li>Pi’s <code>runAgentLoop</code> and provider stream</li>
+            <li><code>read</code>, <code>bash</code>, <code>edit</code>, and <code>write</code></li>
+            <li>Steering, follow-ups, abort, resume, and forks</li>
+            <li>Pi v4 as the only durable session vocabulary</li>
+          </ul>
+        </article>
+        <article>
+          <p class="truth-label truth-add">ADDED BY PI-DSH</p>
+          <h3>The failure semantics around the loop</h3>
+          <ul>
+            <li>Exact request snapshots before provider dispatch</li>
+            <li>Durable pre-tool checkpoints and interrupted-turn repair</li>
+            <li>Closed-prefix compaction with provenance</li>
+            <li>Durable constraints, causal query, and trace UI</li>
+          </ul>
+        </article>
+        <article>
+          <p class="truth-label truth-not">DELIBERATELY NOT</p>
+          <h3>A disguised dsh fork</h3>
+          <ul>
+            <li>No dsh code or Cordis vendored into the runtime</li>
+            <li>No profiles, bundles, HMR, or general plugin loader</li>
+            <li>No parallel transcript or second event vocabulary</li>
+            <li>No claim that approved JavaScript is safely sandboxed</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="guarantees">
+      <div class="section-heading split-heading">
+        <div>
+          <p class="eyebrow">WHY THE ADAPTER EXISTS</p>
+          <h2>Failures become facts, not guesses.</h2>
+        </div>
+        <p>The useful difference is not “more events.” It is what the runtime can prove after a crash, compaction, restart, or dynamic tool change.</p>
+      </div>
+
+      <div class="guarantee-grid">
+        <article class="guarantee-card">
+          <span class="card-index">01</span>
+          <h3>Crash-consistent tools</h3>
+          <p>A missing result is classified as <code>NOT_STARTED</code> or <code>OUTCOME_UNKNOWN</code>. Resume never invents success or blindly retries a side effect.</p>
+        </article>
+        <article class="guarantee-card">
+          <span class="card-index">02</span>
+          <h3>Context with provenance</h3>
+          <p>Compaction shadows a closed, tool-balanced prefix. The summary cites what it replaced; the append-only history stays inspectable.</p>
+        </article>
+        <article class="guarantee-card">
+          <span class="card-index">03</span>
+          <h3>Rules that survive context loss</h3>
+          <p>Constraints are add/revoke events folded into every request, independent of transcript text and preserved across compaction and restart.</p>
+        </article>
+        <article class="guarantee-card">
+          <span class="card-index">04</span>
+          <h3>Causal recall</h3>
+          <p>Search cold sessions, open bounded event windows, trace direct relationships, and cite evidence as stable <code>sessionId:seq:line</code> locations.</p>
+        </article>
+        <article class="guarantee-card">
+          <span class="card-index">05</span>
+          <h3>Bounded modularity</h3>
+          <p>A small per-session component graph supports awaited disposal and idle-only replacement—without making the engine itself a plugin framework.</p>
+        </article>
+        <article class="guarantee-card">
+          <span class="card-index">06</span>
+          <h3>Approved self-extension</h3>
+          <p>The model can define a tool, but a human approves the exact revision and source hash. Activation is process-local and never restored automatically.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section inspect-section" id="inspect">
+      <div class="section-heading split-heading">
+        <div>
+          <p class="eyebrow">READ-ONLY TRAJECTORY</p>
+          <h2>See the complete durable story.</h2>
+        </div>
+        <p>Chat shows the model-visible projection. Trajectory shows requests, operations, tool checkpoints, usage, repairs, compaction, extensions, and causal links.</p>
+      </div>
+      <figure class="viewer-frame">
+        <img src="assets/trajectory.png" alt="pi-dsh trajectory viewer showing a durable event ledger with session list, events, filters, and event details">
+        <figcaption>The viewer never acquires the writer lock, repairs a file, or appends to a session.</figcaption>
+      </figure>
+    </section>
+
+    <section class="section quickstart-section" id="quickstart">
+      <div>
+        <p class="eyebrow">RUN IT</p>
+        <h2>One agent, one session file, one truthful ledger.</h2>
+        <p>Requires Node.js 22.19+, npm, an OpenRouter-compatible key, and a model id.</p>
+        <div class="quick-links">
+          <a href="https://github.com/abhishekgahlot2/pi-dsh/blob/main/docs/getting-started.md">Getting started →</a>
+          <a href="https://github.com/abhishekgahlot2/pi-dsh/blob/main/docs/testing.md">Testing guide →</a>
+          <a href="https://github.com/abhishekgahlot2/pi-dsh/blob/main/docs/self-extension.md">Self-extension trust model →</a>
+        </div>
+      </div>
+      <div class="terminal" aria-label="Quickstart commands">
+        <div class="terminal-bar"><span></span><span></span><span></span><small>terminal</small></div>
+        <pre><code><span class="prompt">$</span> git clone --recurse-submodules \
+  https://github.com/abhishekgahlot2/pi-dsh.git
+<span class="prompt">$</span> cd pi-dsh && npm ci
+<span class="prompt">$</span> cp .env.example .env
+
+<span class="comment"># Set PIDSH_MODEL and OPENROUTER_API_KEY</span>
+<span class="prompt">$</span> npm start
+
+<span class="comment"># In another terminal</span>
+<span class="prompt">$</span> npm run web</code></pre>
+      </div>
+    </section>
+
+    <section class="trust-strip" aria-labelledby="trust-title">
+      <div class="trust-icon" aria-hidden="true">!</div>
+      <div>
+        <h2 id="trust-title">A containment boundary, not a security boundary.</h2>
+        <p>Approved extension JavaScript is trusted local code. Worker threads and <code>node:vm</code> provide lifecycle cleanup and preemption; they do not make malicious code safe.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="brand footer-brand">
+      <span class="brand-mark" aria-hidden="true">π</span>
+      <span><strong>pi-dsh</strong><small>Pi with a durable spine.</small></span>
+    </div>
+    <p>MIT licensed · Pi source retained under its upstream license · dsh semantics ported as tests, not code.</p>
+    <a href="https://github.com/abhishekgahlot2/pi-dsh">Source on GitHub ↗</a>
+  </footer>
+</body>
+</html>
