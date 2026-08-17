@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta name="color-scheme" content="dark">
+	<meta name="theme-color" content="#0a0c0e">
+	<title>pi-dsh — trajectory</title>
+	<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+	<a class="skip-link" href="#event-list">Skip to event log</a>
+	<div class="shell">
+		<header class="topbar">
+			<div class="brand" aria-label="pi-dsh trajectory viewer">
+				<span class="brand-mark" aria-hidden="true">π</span>
+				<div>
+					<strong>pi-dsh</strong>
+					<span>durable trajectory</span>
+				</div>
+			</div>
+			<div class="view-switch" role="tablist" aria-label="Session view">
+				<button id="view-chat" type="button" role="tab" aria-selected="false">Chat</button>
+				<button id="view-trajectory" class="is-active" type="button" role="tab" aria-selected="true">Trajectory</button>
+			</div>
+			<div class="live-state" aria-live="polite">
+				<span id="live-dot" class="live-dot is-idle" aria-hidden="true"></span>
+				<span id="live-label">waiting for session</span>
+				<button id="reload-button" class="icon-button" type="button" aria-label="Refresh sessions" title="Refresh sessions">
+					<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
+				</button>
+			</div>
+		</header>
+
+		<aside class="sessions-pane" aria-label="Session browser">
+			<div class="pane-heading">
+				<div><span class="eyebrow">local archive</span><h1>Sessions</h1></div>
+				<span id="session-count" class="count">0</span>
+			</div>
+			<label class="search-box session-search">
+				<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+				<span class="sr-only">Search sessions</span>
+				<input id="session-search" type="search" placeholder="Filter archive…" autocomplete="off">
+			</label>
+			<nav id="session-list" class="session-list" aria-label="Sessions"></nav>
+			<div class="read-only-note"><span aria-hidden="true">◉</span> Read-only projection</div>
+		</aside>
+
+		<main class="trajectory-pane">
+			<section class="session-header" aria-labelledby="session-title">
+				<div>
+					<span id="session-kicker" class="eyebrow">no session selected</span>
+					<h2 id="session-title">Durable event ledger</h2>
+					<p id="session-path">Choose a session from the archive.</p>
+				</div>
+				<div id="session-metrics" class="session-metrics" aria-label="Session metrics"></div>
+			</section>
+
+			<section id="issues-banner" class="issues-banner" hidden aria-live="polite"></section>
+
+			<div class="toolbar">
+				<label class="search-box event-search">
+					<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+					<span class="sr-only">Search events</span>
+					<input id="event-search" type="search" placeholder="Search payloads, ids, tools…" autocomplete="off">
+					<kbd>/</kbd>
+				</label>
+				<div id="event-filters" class="event-filters" aria-label="Event filters"></div>
+			</div>
+
+			<section class="ledger" aria-label="Trajectory timeline">
+				<div class="ledger-ruler" aria-hidden="true"><span>seq</span><span>durable event</span><span>time</span></div>
+				<div id="event-list" class="event-list" tabindex="0" aria-live="polite"></div>
+			</section>
+		</main>
+
+		<aside id="event-detail" class="detail-pane" aria-label="Event details">
+			<div class="detail-empty">
+				<span class="detail-glyph" aria-hidden="true">⌁</span>
+				<strong>Select an event</strong>
+				<p>Inspect its exact durable payload and correlations.</p>
+			</div>
+		</aside>
+	</div>
+	<div id="toast" class="toast" role="status" aria-live="polite"></div>
+	<script type="module" src="/app.js"></script>
+</body>
+</html>

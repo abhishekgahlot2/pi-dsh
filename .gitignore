@@ -1,0 +1,18 @@
+.DS_Store
+node_modules/
+coverage/
+dist/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+!.env.example
+
+# Local sessions can contain prompts, tool arguments, paths, and model output.
+.pi-dsh/
+
+# OMX execution state, traces, agent transcripts, and temporary plans.
+.omx/
+
+# Private behavioral design notes; executable tests are the public contract.
+spec/

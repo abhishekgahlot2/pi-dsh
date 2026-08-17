@@ -1,0 +1,6 @@
+[submodule "upstream/pi-mono"]
+	path = upstream/pi-mono
+	url = https://github.com/badlogic/pi-mono
+[submodule "upstream/deepseek-harness"]
+	path = upstream/deepseek-harness
+	url = https://github.com/deepseek-ai/deepseek-harness

@@ -1,0 +1,28 @@
+{
+  "name": "pi-dsh",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "start": "tsx --env-file=.env src/main.ts",
+    "test": "vitest run",
+    "sync": "node scripts/sync-vendor.mjs",
+    "web": "tsx --env-file=.env web/server.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.84.2",
+    "@sinclair/typebox": "^0.34.0",
+    "@standard-schema/spec": "^1.1.0",
+    "diff": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0"
+  }
+}
